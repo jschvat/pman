@@ -212,3 +212,13 @@ add_executable(pman_race_simple_test tests/race_simple_test.cpp)
 target_link_libraries(pman_race_simple_test PRIVATE pman)
 add_executable(test_runonce_debug tests/test_runonce_debug.cpp)
 target_link_libraries(test_runonce_debug PRIVATE pman)
+
+# Comprehensive test suites
+add_executable(pman_comprehensive_stress tests/comprehensive_stress.cpp)
+target_link_libraries(pman_comprehensive_stress PRIVATE pman rt)
+
+add_executable(pman_performance_regression tests/performance_regression.cpp)
+target_link_libraries(pman_performance_regression PRIVATE pman)
+
+add_executable(pman_edge_cases tests/edge_cases.cpp)
+target_link_libraries(pman_edge_cases PRIVATE pman)
