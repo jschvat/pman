@@ -95,12 +95,10 @@ uint64_t EpollLoop::addTimer(std::chrono::nanoseconds duration, std::function<vo
     uint64_t id = nextTimerId_++;
     auto expiry = std::chrono::steady_clock::now() + duration;
 
-    TimerData timer{id, expiry};
-    timers_.push(timer);
-    timerCallbacks_[id] = std::move(callback);
-    timerPeriods_[id] = std::chrono::nanoseconds(0);
-
-    // OPTIMIZATION: No eventfd write needed - runOnce() calculates timeout dynamically
+    // PHASE 2: Insert into multimap and store iterator for O(1) cancellation
+    TimerEntry entry{id, std::move(callback), std::chrono::nanoseconds(0)};
+    auto it = timersByExpiry_.emplace(expiry, std::move(entry));
+    timerById_[id] = it;
 
     return id;
 }
@@ -109,20 +107,24 @@ uint64_t EpollLoop::addPeriodicTimer(std::chrono::nanoseconds period, std::funct
     uint64_t id = nextTimerId_++;
     auto expiry = std::chrono::steady_clock::now() + period;
 
-    TimerData timer{id, expiry};
-    timers_.push(timer);
-    timerCallbacks_[id] = std::move(callback);
-    timerPeriods_[id] = period;
-
-    // OPTIMIZATION: No eventfd write needed - runOnce() calculates timeout dynamically
+    // PHASE 2: Insert into multimap with period info
+    TimerEntry entry{id, std::move(callback), period};
+    auto it = timersByExpiry_.emplace(expiry, std::move(entry));
+    timerById_[id] = it;
 
     return id;
 }
 
 bool EpollLoop::cancelTimer(uint64_t timerId) {
-    auto erased1 = timerCallbacks_.erase(timerId);
-    timerPeriods_.erase(timerId);
-    return erased1 > 0;
+    // PHASE 2: O(1) cancellation via iterator lookup
+    auto it = timerById_.find(timerId);
+    if (it == timerById_.end()) {
+        return false;
+    }
+
+    timersByExpiry_.erase(it->second);
+    timerById_.erase(it);
+    return true;
 }
 
 bool EpollLoop::runOnce(std::chrono::nanoseconds timeout) {
@@ -134,11 +136,10 @@ bool EpollLoop::runOnce(std::chrono::nanoseconds timeout) {
         return false;
     }
 
-    // OPTIMIZATION: Only process timers if we have any and they're ready
-    // Check AFTER epoll_wait since time has passed
-    if (!timers_.empty()) {
+    // PHASE 2: Only process timers if we have any and they're ready
+    if (!timersByExpiry_.empty()) {
         auto now = std::chrono::steady_clock::now();
-        if (timers_.top().expiry <= now) {
+        if (timersByExpiry_.begin()->first <= now) {
             processTimers();
         }
     }
@@ -228,56 +229,59 @@ size_t EpollLoop::activeFds() const noexcept {
 }
 
 size_t EpollLoop::activeTimers() const noexcept {
-    return timerCallbacks_.size();
+    return timerById_.size();
 }
 
 void EpollLoop::processTimers() {
     auto now = std::chrono::steady_clock::now();
 
-    // OPTIMIZATION: Batch callbacks for better throughput
+    // PHASE 2: Batch callbacks for better throughput
     std::vector<std::function<void()>> batch;
-    batch.reserve(32);  // Reserve space for typical batch size
+    batch.reserve(32);
 
-    while (!timers_.empty()) {
-        const auto& timer = timers_.top();
+    // PHASE 2: Collect timers to reschedule (can't modify map while iterating)
+    std::vector<std::pair<TimePoint, TimerEntry>> toReschedule;
 
-        if (timer.expiry > now) {
-            break;
+    // PHASE 2: Iterate from beginning (earliest) until we hit unexpired timer
+    auto it = timersByExpiry_.begin();
+    while (it != timersByExpiry_.end()) {
+        if (it->first > now) {
+            break;  // All remaining timers are in the future
         }
 
-        // CRITICAL FIX: Copy timer ID before popping! The reference becomes invalid after pop().
-        uint64_t timerId = timer.id;
+        const auto& entry = it->second;
+        uint64_t timerId = entry.id;
 
-        auto callbackIt = timerCallbacks_.find(timerId);
-        auto periodIt = timerPeriods_.find(timerId);
+        // Copy callback before modifying containers
+        auto callback = entry.callback;
+        auto period = entry.period;
 
-        if (callbackIt == timerCallbacks_.end() || periodIt == timerPeriods_.end()) {
-            timers_.pop();
-            continue;
-        }
+        // Remove from id lookup
+        timerById_.erase(timerId);
 
-        // CRITICAL FIX: Copy callback BEFORE any map modifications
-        auto callback = callbackIt->second;
-        auto period = periodIt->second;
-
-        timers_.pop();
-
-        // Reschedule periodic timer or cleanup one-shot
+        // If periodic, schedule for reschedule (can't insert while iterating)
         if (period.count() > 0) {
-            TimerData nextTimer{timerId, now + period};
-            timers_.push(nextTimer);
-        } else {
-            timerCallbacks_.erase(timerId);
-            timerPeriods_.erase(timerId);
+            TimerEntry newEntry{timerId, callback, period};
+            toReschedule.emplace_back(now + period, std::move(newEntry));
         }
 
-        // OPTIMIZATION: Batch callback instead of executing immediately
+        // Batch the callback
         if (callback) {
             batch.push_back(std::move(callback));
         }
+
+        // Erase and advance
+        it = timersByExpiry_.erase(it);
     }
 
-    // Execute all callbacks in batch (better cache locality, fewer context switches)
+    // PHASE 2: Reschedule periodic timers
+    for (auto& [expiry, entry] : toReschedule) {
+        uint64_t id = entry.id;
+        auto newIt = timersByExpiry_.emplace(expiry, std::move(entry));
+        timerById_[id] = newIt;
+    }
+
+    // Execute all callbacks in batch (better cache locality)
     detail::TrampolineGuard guard;
     for (auto& callback : batch) {
         callback();
@@ -285,19 +289,19 @@ void EpollLoop::processTimers() {
 }
 
 std::chrono::milliseconds EpollLoop::getNextTimerTimeout() const {
-    if (timers_.empty()) {
+    if (timersByExpiry_.empty()) {
         return std::chrono::milliseconds(1000);
     }
 
     auto now = std::chrono::steady_clock::now();
-    const auto& nextTimer = timers_.top();
+    const auto& nextExpiry = timersByExpiry_.begin()->first;
 
-    if (nextTimer.expiry <= now) {
+    if (nextExpiry <= now) {
         return std::chrono::milliseconds(0);
     }
 
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
-        nextTimer.expiry - now);
+        nextExpiry - now);
 
     return duration;
 }

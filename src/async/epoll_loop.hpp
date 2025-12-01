@@ -3,10 +3,11 @@
 #include "event_loop_impl.hpp"
 #include <sys/epoll.h>
 #include <chrono>
-#include <queue>
 #include <map>
+#include <unordered_map>
 #include <functional>
 #include <vector>
+#include <optional>
 
 namespace pman::async {
 
@@ -34,13 +35,11 @@ public:
     size_t activeTimers() const noexcept override;
 
 private:
-    struct TimerData {
+    // PHASE 2 OPTIMIZATION: Consolidated timer entry - all data in one place
+    struct TimerEntry {
         uint64_t id;
-        std::chrono::steady_clock::time_point expiry;
-
-        bool operator>(const TimerData& other) const {
-            return expiry > other.expiry;
-        }
+        std::function<void()> callback;
+        std::chrono::nanoseconds period{0};  // 0 = one-shot, >0 = periodic
     };
 
     void processTimers();
@@ -51,9 +50,17 @@ private:
     int eventFd_{-1};
     bool running_{false};
 
-    std::priority_queue<TimerData, std::vector<TimerData>, std::greater<TimerData>> timers_;
-    std::map<uint64_t, std::function<void()>> timerCallbacks_;
-    std::map<uint64_t, std::chrono::nanoseconds> timerPeriods_;
+    // PHASE 2 OPTIMIZATION: Use multimap instead of priority_queue
+    // - Sorted by expiry time (earliest first)
+    // - O(1) access to next timer
+    // - Efficient iteration for batch processing
+    // - Easy cancellation via id lookup
+    using TimePoint = std::chrono::steady_clock::time_point;
+    std::multimap<TimePoint, TimerEntry> timersByExpiry_;
+
+    // PHASE 2 OPTIMIZATION: Fast lookup for cancellation - maps id to iterator
+    std::unordered_map<uint64_t, std::multimap<TimePoint, TimerEntry>::iterator> timerById_;
+
     uint64_t nextTimerId_{1};
 
     std::map<int, EventCallback> fdCallbacks_;
