@@ -14,7 +14,7 @@ IoUringLoop::IoUringLoop(const EventLoopConfig& config) {
     io_uring_params params{};
     params.flags = 0;
 
-    ring_.ring_fd = io_uring_setup(256, &params);
+    ring_.ring_fd = io_uring_setup(config.io_uring_entries > 0 ? config.io_uring_entries : 256, &params);
     if (ring_.ring_fd < 0) {
         throw std::runtime_error("Failed to setup io_uring");
     }
@@ -92,36 +92,65 @@ void IoUringLoop::run() {
     running_ = true;
 
     while (running_) {
+        // Process ready timers first
         processTimers();
+
+        // Submit a timeout for next timer if we have one pending
         submitTimerOp();
+
+        // Submit any pending SQEs - memory barrier
         submitSqes();
 
-        int ret = io_uring_enter(ring_.ring_fd, 0, 1, IORING_ENTER_GETEVENTS, nullptr);
-        if (ret < 0 && errno != EINTR) {
-            throw std::runtime_error("io_uring_enter failed");
+        // Determine how to wait
+        uint32_t to_submit = sqPendingCount_;
+        sqPendingCount_ = 0;
+
+        // If we have no timers and nothing to submit, just do a short poll
+        unsigned int flags = 0;
+        unsigned int min_complete = 0;
+
+        if (to_submit > 0 || timerOpPending_) {
+            // We have pending work, wait for at least one completion
+            flags = IORING_ENTER_GETEVENTS;
+            min_complete = 1;
         }
 
+        int ret = io_uring_enter(ring_.ring_fd, to_submit, min_complete, flags, nullptr);
+
+        if (ret < 0 && errno != EINTR && errno != ETIME) {
+            // ETIME is expected when timeout expires
+            if (errno != ETIME) {
+                throw std::runtime_error("io_uring_enter failed");
+            }
+        }
+
+        // Process completions
         processCqes();
 
         // Process posted callbacks at end of iteration
         processPostedCallbacks();
+
+        // If no timers and nothing pending, avoid spinning
+        if (timersByExpiry_.empty() && postedCallbacks_.empty() && !timerOpPending_) {
+            break;
+        }
     }
 }
 
 void IoUringLoop::stop() {
     running_ = false;
     uint64_t val = 1;
-    write(eventFd_, &val, sizeof(val));
+    [[maybe_unused]] auto r = write(eventFd_, &val, sizeof(val));
 }
 
 uint64_t IoUringLoop::addTimer(std::chrono::nanoseconds duration, std::function<void()> callback) {
     uint64_t id = nextTimerId_++;
     auto expiry = std::chrono::steady_clock::now() + duration;
 
-    TimerData timer{id, expiry};
-    timers_.push(timer);
-    timerCallbacks_[id] = std::move(callback);
-    timerPeriods_[id] = std::chrono::nanoseconds(0);
+    // Phase 2: Insert into multimap and store iterator for O(1) cancellation
+    TimerEntry entry{id, std::move(callback), std::chrono::nanoseconds(0)};
+    auto it = timersByExpiry_.emplace(expiry, std::move(entry));
+    timerById_[id] = it;
 
     return id;
 }
@@ -130,18 +159,24 @@ uint64_t IoUringLoop::addPeriodicTimer(std::chrono::nanoseconds period, std::fun
     uint64_t id = nextTimerId_++;
     auto expiry = std::chrono::steady_clock::now() + period;
 
-    TimerData timer{id, expiry};
-    timers_.push(timer);
-    timerCallbacks_[id] = std::move(callback);
-    timerPeriods_[id] = period;
+    // Phase 2: Insert into multimap with period info
+    TimerEntry entry{id, std::move(callback), period};
+    auto it = timersByExpiry_.emplace(expiry, std::move(entry));
+    timerById_[id] = it;
 
     return id;
 }
 
 bool IoUringLoop::cancelTimer(uint64_t timerId) {
-    auto erased1 = timerCallbacks_.erase(timerId);
-    timerPeriods_.erase(timerId);
-    return erased1 > 0;
+    // Phase 2: O(1) cancellation via iterator lookup
+    auto it = timerById_.find(timerId);
+    if (it == timerById_.end()) {
+        return false;
+    }
+
+    timersByExpiry_.erase(it->second);
+    timerById_.erase(it);
+    return true;
 }
 
 bool IoUringLoop::runOnce(std::chrono::nanoseconds timeout) {
@@ -149,12 +184,15 @@ bool IoUringLoop::runOnce(std::chrono::nanoseconds timeout) {
     submitTimerOp();
     submitSqes();
 
-    int ret = io_uring_enter(ring_.ring_fd, 0, 1, IORING_ENTER_GETEVENTS, nullptr);
-    if (ret < 0 && errno != EINTR) {
+    int ret = io_uring_enter(ring_.ring_fd, sqPendingCount_, 1, IORING_ENTER_GETEVENTS, nullptr);
+    sqPendingCount_ = 0;
+
+    if (ret < 0 && errno != EINTR && errno != ETIME) {
         return false;
     }
 
     processCqes();
+    processPostedCallbacks();
     return true;
 }
 
@@ -167,22 +205,22 @@ BackendType IoUringLoop::backend() const noexcept {
 }
 
 void IoUringLoop::addFd(int fd, Event events, EventCallback callback) {
-    // Stub implementation
+    // TODO: Implement FD monitoring with io_uring
 }
 
 void IoUringLoop::modifyFd(int fd, Event events) {
-    // Stub implementation
+    // TODO: Implement FD modification
 }
 
 void IoUringLoop::removeFd(int fd) {
-    // Stub implementation
+    // TODO: Implement FD removal
 }
 
 void IoUringLoop::post(std::function<void()> callback) {
     postedCallbacks_.push_back(std::move(callback));
     // Wake up the event loop
     uint64_t val = 1;
-    write(eventFd_, &val, sizeof(val));
+    [[maybe_unused]] auto r = write(eventFd_, &val, sizeof(val));
 }
 
 void IoUringLoop::processPostedCallbacks() {
@@ -207,63 +245,78 @@ size_t IoUringLoop::activeFds() const noexcept {
 }
 
 size_t IoUringLoop::activeTimers() const noexcept {
-    return timerCallbacks_.size();
+    return timerById_.size();
 }
 
 void IoUringLoop::processTimers() {
     auto now = std::chrono::steady_clock::now();
 
-    while (!timers_.empty()) {
-        const auto& timer = timers_.top();
+    // Phase 2: Batch callbacks for better throughput
+    std::vector<std::function<void()>> batch;
+    batch.reserve(32);
 
-        if (timer.expiry > now) {
-            break;
+    // Phase 2: Collect timers to reschedule (can't modify map while iterating)
+    std::vector<std::pair<TimePoint, TimerEntry>> toReschedule;
+
+    // Phase 2: Iterate from beginning (earliest) until we hit unexpired timer
+    auto it = timersByExpiry_.begin();
+    while (it != timersByExpiry_.end()) {
+        if (it->first > now) {
+            break;  // All remaining timers are in the future
         }
 
-        auto callbackIt = timerCallbacks_.find(timer.id);
-        auto periodIt = timerPeriods_.find(timer.id);
+        const auto& entry = it->second;
+        uint64_t timerId = entry.id;
 
-        if (callbackIt == timerCallbacks_.end() || periodIt == timerPeriods_.end()) {
-            timers_.pop();
-            continue;
-        }
+        // Copy callback before modifying containers
+        auto callback = entry.callback;
+        auto period = entry.period;
 
-        // CRITICAL FIX: Copy callback BEFORE any map modifications
-        auto callback = callbackIt->second;
-        auto period = periodIt->second;
+        // Remove from id lookup
+        timerById_.erase(timerId);
 
-        timers_.pop();
-
-        // Reschedule periodic timer or cleanup one-shot
+        // If periodic, schedule for reschedule (can't insert while iterating)
         if (period.count() > 0) {
-            TimerData nextTimer{timer.id, now + period};
-            timers_.push(nextTimer);
-        } else {
-            timerCallbacks_.erase(timer.id);
-            timerPeriods_.erase(timer.id);
+            TimerEntry newEntry{timerId, callback, period};
+            toReschedule.emplace_back(now + period, std::move(newEntry));
         }
 
-        // Invoke callback last with trampoline guard
+        // Batch the callback
         if (callback) {
-            detail::TrampolineGuard guard;
-            callback();
+            batch.push_back(std::move(callback));
         }
+
+        // Erase and advance
+        it = timersByExpiry_.erase(it);
+    }
+
+    // Phase 2: Reschedule periodic timers
+    for (auto& [expiry, entry] : toReschedule) {
+        uint64_t id = entry.id;
+        auto newIt = timersByExpiry_.emplace(expiry, std::move(entry));
+        timerById_[id] = newIt;
+    }
+
+    // Execute all callbacks in batch (better cache locality)
+    detail::TrampolineGuard guard;
+    for (auto& callback : batch) {
+        callback();
     }
 }
 
 void IoUringLoop::submitTimerOp() {
-    if (timers_.empty() || timerOpPending_) {
+    if (timersByExpiry_.empty() || timerOpPending_) {
         return;
     }
 
     auto now = std::chrono::steady_clock::now();
-    const auto& nextTimer = timers_.top();
+    const auto& nextExpiry = timersByExpiry_.begin()->first;
 
-    if (nextTimer.expiry <= now) {
-        return;
+    if (nextExpiry <= now) {
+        return;  // Timer already ready, will be processed in processTimers
     }
 
-    auto duration = nextTimer.expiry - now;
+    auto duration = nextExpiry - now;
     auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count();
 
     currentTimeout_.tv_sec = ns / 1000000000;
@@ -278,31 +331,34 @@ void IoUringLoop::submitTimerOp() {
     sqe->opcode = IORING_OP_TIMEOUT;
     sqe->addr = reinterpret_cast<uint64_t>(&currentTimeout_);
     sqe->len = 1;
-    sqe->user_data = 0;
+    sqe->user_data = 0;  // Timer completions use user_data = 0
 
     timerOpPending_ = true;
 }
 
 io_uring_sqe* IoUringLoop::getSqe() {
-    uint32_t tail = *ring_.sq_tail;
-    uint32_t next = tail + 1;
     uint32_t head = __atomic_load_n(ring_.sq_head, __ATOMIC_ACQUIRE);
+    uint32_t tail = *ring_.sq_tail;
 
-    if (next - head > *ring_.sq_entries) {
+    // Check if queue is full
+    if (tail - head >= *ring_.sq_entries) {
         return nullptr;
     }
 
-    io_uring_sqe* sqe = &ring_.sqes[tail & *ring_.sq_mask];
-    ring_.sq_array[tail & *ring_.sq_mask] = tail & *ring_.sq_mask;
+    uint32_t index = tail & *ring_.sq_mask;
+    io_uring_sqe* sqe = &ring_.sqes[index];
+    ring_.sq_array[index] = index;
+
+    // Advance tail for next getSqe call
+    *ring_.sq_tail = tail + 1;
+    sqPendingCount_++;
 
     return sqe;
 }
 
 void IoUringLoop::submitSqes() {
-    uint32_t tail = *ring_.sq_tail;
-    if (tail != *ring_.sq_tail) {
-        __atomic_store_n(ring_.sq_tail, tail, __ATOMIC_RELEASE);
-    }
+    // Memory barrier to ensure SQE writes are visible before we update tail
+    __atomic_store_n(ring_.sq_tail, *ring_.sq_tail, __ATOMIC_RELEASE);
 }
 
 void IoUringLoop::processCqes() {
@@ -313,8 +369,10 @@ void IoUringLoop::processCqes() {
         io_uring_cqe* cqe = &ring_.cqes[head & *ring_.cq_mask];
 
         if (cqe->user_data == 0) {
+            // Timer completion
             timerOpPending_ = false;
         } else {
+            // User FD/operation completion
             auto it = userDataCallbacks_.find(cqe->user_data);
             if (it != userDataCallbacks_.end()) {
                 detail::TrampolineGuard guard;

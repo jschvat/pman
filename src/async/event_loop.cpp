@@ -18,18 +18,9 @@ std::unique_ptr<EventLoopImpl> createBackend(const EventLoopConfig& config) {
 
     // Auto-select best backend
     if (backend == BackendType::Auto) {
-        // TODO: io_uring has timer callback corruption issues - default to epoll for now
-        // Prefer io_uring if available and safe (kernel 5.12+)
-        // if (detail::is_io_uring_safe()) {
-        //     try {
-        //         return std::make_unique<IoUringLoop>(config);
-        //     } catch (...) {
-        //         // Fall back to epoll if io_uring setup fails
-        //         backend = BackendType::Epoll;
-        //     }
-        // } else {
-            backend = BackendType::Epoll;
-        // }
+        // Default to epoll for now - io_uring is available but opt-in
+        // io_uring works for timers but needs more testing with coroutines
+        backend = BackendType::Epoll;
     }
 
     switch (backend) {

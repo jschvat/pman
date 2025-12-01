@@ -222,3 +222,6 @@ target_link_libraries(pman_performance_regression PRIVATE pman)
 
 add_executable(pman_edge_cases tests/edge_cases.cpp)
 target_link_libraries(pman_edge_cases PRIVATE pman)
+
+add_executable(pman_io_uring_test tests/io_uring_test.cpp)
+target_link_libraries(pman_io_uring_test PRIVATE pman)

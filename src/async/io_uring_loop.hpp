@@ -4,8 +4,8 @@
 #include <linux/io_uring.h>
 #include <linux/time_types.h>
 #include <chrono>
-#include <queue>
 #include <map>
+#include <unordered_map>
 #include <functional>
 #include <vector>
 #include <memory>
@@ -36,14 +36,14 @@ public:
     size_t activeTimers() const noexcept override;
 
 private:
-    struct TimerData {
+    // Phase 2: Consolidated timer entry (matching epoll_loop optimization)
+    struct TimerEntry {
         uint64_t id;
-        std::chrono::steady_clock::time_point expiry;
-
-        bool operator>(const TimerData& other) const {
-            return expiry > other.expiry;
-        }
+        std::function<void()> callback;
+        std::chrono::nanoseconds period{0};  // 0 = one-shot, >0 = periodic
     };
+
+    using TimePoint = std::chrono::steady_clock::time_point;
 
     struct IoUringState {
         int ring_fd{-1};
@@ -80,9 +80,9 @@ private:
     int eventFd_{-1};
     bool running_{false};
 
-    std::priority_queue<TimerData, std::vector<TimerData>, std::greater<TimerData>> timers_;
-    std::map<uint64_t, std::function<void()>> timerCallbacks_;
-    std::map<uint64_t, std::chrono::nanoseconds> timerPeriods_;
+    // Phase 2: Multimap for O(1) next timer access, unordered_map for O(1) cancellation
+    std::multimap<TimePoint, TimerEntry> timersByExpiry_;
+    std::unordered_map<uint64_t, std::multimap<TimePoint, TimerEntry>::iterator> timerById_;
     uint64_t nextTimerId_{1};
 
     std::map<uint64_t, std::function<void(int)>> userDataCallbacks_;
@@ -91,6 +91,8 @@ private:
     bool timerOpPending_{false};
     __kernel_timespec currentTimeout_{};
     std::vector<std::function<void()>> postedCallbacks_;
+
+    uint32_t sqPendingCount_{0};  // Track pending SQEs to submit
 };
 
 } // namespace pman::async
