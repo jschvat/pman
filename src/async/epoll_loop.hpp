@@ -42,9 +42,10 @@ private:
         std::chrono::nanoseconds period{0};  // 0 = one-shot, >0 = periodic
     };
 
+    // PHASE 3: Inline hot-path helper functions
     void processTimers();
-    void processPostedCallbacks();
-    std::chrono::milliseconds getNextTimerTimeout() const;
+    inline void processPostedCallbacks();
+    inline std::chrono::milliseconds getNextTimerTimeout() const;
 
     int epollFd_{-1};
     int eventFd_{-1};

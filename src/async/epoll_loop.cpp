@@ -207,8 +207,9 @@ void EpollLoop::post(std::function<void()> callback) {
     write(eventFd_, &val, sizeof(val));
 }
 
-void EpollLoop::processPostedCallbacks() {
-    if (postedCallbacks_.empty()) {
+// PHASE 3: Inline hot-path function with branch prediction hints
+inline void EpollLoop::processPostedCallbacks() {
+    if (postedCallbacks_.empty()) [[likely]] {
         return;
     }
 
@@ -217,7 +218,7 @@ void EpollLoop::processPostedCallbacks() {
     callbacks.swap(postedCallbacks_);
 
     for (auto& callback : callbacks) {
-        if (callback) {
+        if (callback) [[likely]] {
             detail::TrampolineGuard guard;
             callback();
         }
@@ -288,15 +289,16 @@ void EpollLoop::processTimers() {
     }
 }
 
-std::chrono::milliseconds EpollLoop::getNextTimerTimeout() const {
-    if (timersByExpiry_.empty()) {
+// PHASE 3: Inline hot-path function with branch prediction hints
+inline std::chrono::milliseconds EpollLoop::getNextTimerTimeout() const {
+    if (timersByExpiry_.empty()) [[unlikely]] {
         return std::chrono::milliseconds(1000);
     }
 
     auto now = std::chrono::steady_clock::now();
     const auto& nextExpiry = timersByExpiry_.begin()->first;
 
-    if (nextExpiry <= now) {
+    if (nextExpiry <= now) [[unlikely]] {
         return std::chrono::milliseconds(0);
     }
 

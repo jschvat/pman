@@ -69,11 +69,12 @@ private:
         io_uring_cqe* cqes{nullptr};
     };
 
+    // PHASE 3: Inline hot-path helper functions
     void processTimers();
-    void processPostedCallbacks();
-    void submitTimerOp();
-    io_uring_sqe* getSqe();
-    void submitSqes();
+    inline void processPostedCallbacks();
+    inline void submitTimerOp();
+    inline io_uring_sqe* getSqe();
+    inline void submitSqes();
     void processCqes();
 
     IoUringState ring_;

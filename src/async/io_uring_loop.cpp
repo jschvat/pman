@@ -223,8 +223,9 @@ void IoUringLoop::post(std::function<void()> callback) {
     [[maybe_unused]] auto r = write(eventFd_, &val, sizeof(val));
 }
 
-void IoUringLoop::processPostedCallbacks() {
-    if (postedCallbacks_.empty()) {
+// PHASE 3: Inline hot-path function with branch prediction hints
+inline void IoUringLoop::processPostedCallbacks() {
+    if (postedCallbacks_.empty()) [[likely]] {
         return;
     }
 
@@ -233,7 +234,7 @@ void IoUringLoop::processPostedCallbacks() {
     callbacks.swap(postedCallbacks_);
 
     for (auto& callback : callbacks) {
-        if (callback) {
+        if (callback) [[likely]] {
             detail::TrampolineGuard guard;
             callback();
         }
@@ -304,15 +305,16 @@ void IoUringLoop::processTimers() {
     }
 }
 
-void IoUringLoop::submitTimerOp() {
-    if (timersByExpiry_.empty() || timerOpPending_) {
+// PHASE 3: Inline hot-path function with branch prediction hints
+inline void IoUringLoop::submitTimerOp() {
+    if (timersByExpiry_.empty() || timerOpPending_) [[unlikely]] {
         return;
     }
 
     auto now = std::chrono::steady_clock::now();
     const auto& nextExpiry = timersByExpiry_.begin()->first;
 
-    if (nextExpiry <= now) {
+    if (nextExpiry <= now) [[unlikely]] {
         return;  // Timer already ready, will be processed in processTimers
     }
 
@@ -323,7 +325,7 @@ void IoUringLoop::submitTimerOp() {
     currentTimeout_.tv_nsec = ns % 1000000000;
 
     io_uring_sqe* sqe = getSqe();
-    if (!sqe) {
+    if (!sqe) [[unlikely]] {
         return;
     }
 
@@ -336,12 +338,13 @@ void IoUringLoop::submitTimerOp() {
     timerOpPending_ = true;
 }
 
-io_uring_sqe* IoUringLoop::getSqe() {
+// PHASE 3: Inline hot-path function with branch prediction hints
+inline io_uring_sqe* IoUringLoop::getSqe() {
     uint32_t head = __atomic_load_n(ring_.sq_head, __ATOMIC_ACQUIRE);
     uint32_t tail = *ring_.sq_tail;
 
     // Check if queue is full
-    if (tail - head >= *ring_.sq_entries) {
+    if (tail - head >= *ring_.sq_entries) [[unlikely]] {
         return nullptr;
     }
 
@@ -356,7 +359,8 @@ io_uring_sqe* IoUringLoop::getSqe() {
     return sqe;
 }
 
-void IoUringLoop::submitSqes() {
+// PHASE 3: Inline hot-path function
+inline void IoUringLoop::submitSqes() {
     // Memory barrier to ensure SQE writes are visible before we update tail
     __atomic_store_n(ring_.sq_tail, *ring_.sq_tail, __ATOMIC_RELEASE);
 }
