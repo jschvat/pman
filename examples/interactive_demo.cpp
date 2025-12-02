@@ -15,6 +15,7 @@
 #include <atomic>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <fcntl.h>
 
 // Core PMAN
 #include "pman/thread.hpp"
@@ -377,37 +378,54 @@ void demo_async_file_io() {
     std::cout << "Testing async file operations...\n\n";
 
     EventLoop loop;
+    bool done = false;
 
     auto demo = [&]() -> Task<void> {
         const std::string filename = "/tmp/pman_demo.txt";
         const std::string content = "Hello from PMAN async file I/O!\nLine 2\nLine 3";
 
         std::cout << "1. Writing file asynchronously...\n";
-        auto write_res = co_await writeFile(filename, content);
+
+        // Use explicit AsyncFile API
+        auto file = AsyncFile::open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        auto write_res = co_await file.write(content);
 
         if (write_res.ok()) {
             std::cout << "   ✓ Wrote " << write_res.value << " bytes\n\n";
         }
 
         std::cout << "2. Reading file asynchronously...\n";
-        auto read_res = co_await readFile(filename);
+
+        auto file2 = AsyncFile::open(filename, O_RDONLY);
+        auto read_res = co_await file2.read(1024);
 
         if (read_res.ok()) {
+            std::string read_content(read_res.value.begin(), read_res.value.end());
             std::cout << "   ✓ Read " << read_res.value.size() << " bytes\n";
             std::cout << "   Content:\n";
-            std::cout << "   " << read_res.value << "\n";
+            std::cout << "   " << read_content << "\n";
         }
 
         // Cleanup
         unlink(filename.c_str());
 
+        done = true;
         loop.stop();
     };
 
-    demo().start();
+    // Start task after scheduling a timer to ensure loop is running
+    loop.addTimer(std::chrono::milliseconds(1), [&]() {
+        demo().start();
+    });
+
     loop.run();
 
-    std::cout << "\n✓ Async file I/O completed without blocking!\n";
+    if (done) {
+        std::cout << "\n✓ Async file I/O completed without blocking!\n";
+    } else {
+        std::cout << "\n✗ File I/O did not complete\n";
+    }
+
     waitForEnter();
 }
 
