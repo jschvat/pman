@@ -103,6 +103,9 @@ if(PMAN_BUILD_EXAMPLES)
 
     add_executable(pman_async_simple_demo examples/async_simple_demo.cpp)
     target_link_libraries(pman_async_simple_demo PRIVATE pman)
+
+    add_executable(pman_interactive_demo examples/interactive_demo.cpp)
+    target_link_libraries(pman_interactive_demo PRIVATE pman)
 endif()
 
 if(PMAN_BUILD_TESTS)
