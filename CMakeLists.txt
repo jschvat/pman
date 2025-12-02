@@ -232,8 +232,12 @@ target_link_libraries(pman_combinators_test PRIVATE pman)
 add_executable(pman_async_sync_primitives_test tests/async_sync_primitives_test.cpp)
 target_link_libraries(pman_async_sync_primitives_test PRIVATE pman)
 
+add_executable(pman_async_file_test tests/async_file_test.cpp)
+target_link_libraries(pman_async_file_test PRIVATE pman)
+
 if(PMAN_BUILD_TESTS)
     add_test(NAME pman_io_uring_test COMMAND pman_io_uring_test)
     add_test(NAME pman_combinators_test COMMAND pman_combinators_test)
     add_test(NAME pman_async_sync_primitives_test COMMAND pman_async_sync_primitives_test)
+    add_test(NAME pman_async_file_test COMMAND pman_async_file_test)
 endif()
