@@ -60,7 +60,7 @@ add_library(pman
     src/async/sleep.cpp
     src/async/timeout.cpp
     src/async/interval.cpp
-    src/async/channel.cpp
+    # channel.hpp is header-only
 )
 add_library(pman::pman ALIAS pman)
 
@@ -238,9 +238,13 @@ target_link_libraries(pman_async_sync_primitives_test PRIVATE pman)
 add_executable(pman_async_file_test tests/async_file_test.cpp)
 target_link_libraries(pman_async_file_test PRIVATE pman)
 
+add_executable(pman_async_channel_test tests/async_channel_test.cpp)
+target_link_libraries(pman_async_channel_test PRIVATE pman)
+
 if(PMAN_BUILD_TESTS)
     add_test(NAME pman_io_uring_test COMMAND pman_io_uring_test)
     add_test(NAME pman_combinators_test COMMAND pman_combinators_test)
     add_test(NAME pman_async_sync_primitives_test COMMAND pman_async_sync_primitives_test)
     add_test(NAME pman_async_file_test COMMAND pman_async_file_test)
+    add_test(NAME pman_async_channel_test COMMAND pman_async_channel_test)
 endif()

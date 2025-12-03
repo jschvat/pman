@@ -32,6 +32,7 @@
 #include "pman/async/semaphore.hpp"
 #include "pman/async/rwlock.hpp"
 #include "pman/async/file.hpp"
+#include "pman/async/channel.hpp"
 
 using namespace pman;
 using namespace pman::async;
@@ -429,6 +430,63 @@ void demo_async_file_io() {
     waitForEnter();
 }
 
+void demo_async_channel() {
+    clearScreen();
+    printHeader("Async Channel (Message Passing)");
+
+    std::cout << "Testing async channel for producer/consumer pattern...\n";
+    std::cout << "Channel capacity: 5\n\n";
+
+    EventLoop loop;
+    std::atomic<int> items_produced{0};
+    std::atomic<int> items_consumed{0};
+
+    auto producer = [&](Sender<int> tx) -> Task<void> {
+        std::cout << "[Producer] Starting...\n";
+        for (int i = 1; i <= 10; i++) {
+            co_await tx.send(i);
+            items_produced++;
+            std::cout << "[Producer] Sent: " << i << "\n";
+            co_await sleep(Duration::fromMillis(20), EventLoop::current());
+        }
+        tx.close();
+        std::cout << "[Producer] Done!\n";
+    };
+
+    auto consumer = [&](Receiver<int> rx) -> Task<void> {
+        std::cout << "[Consumer] Starting...\n";
+        while (auto value = co_await rx.recv()) {
+            items_consumed++;
+            std::cout << "[Consumer] Received: " << *value << "\n";
+            co_await sleep(Duration::fromMillis(30), EventLoop::current());
+        }
+        std::cout << "[Consumer] Done!\n";
+    };
+
+    auto task = [&]() -> Task<void> {
+        auto [tx, rx] = channel<int>(5);
+
+        producer(tx).start();
+        consumer(rx).start();
+
+        // Wait for completion
+        co_await sleep(Duration::fromMillis(500), EventLoop::current());
+
+        loop.stop();
+    };
+
+    loop.addTimer(std::chrono::milliseconds(1), [&]() {
+        task().start();
+    });
+
+    loop.run();
+
+    std::cout << "\n✓ Produced " << items_produced << " items\n";
+    std::cout << "✓ Consumed " << items_consumed << " items\n";
+    std::cout << "✓ Channel handled async message passing!\n";
+    waitForEnter();
+}
+
 //=============================================================================
 // MAIN MENU
 //=============================================================================
@@ -456,12 +514,13 @@ void showMenu() {
     std::cout << "  6. Async Combinators (all, any, first)\n";
     std::cout << "  7. Async Mutex\n";
     std::cout << "  8. Async Semaphore\n";
-    std::cout << "  9. Async File I/O\n\n";
+    std::cout << "  9. Async File I/O\n";
+    std::cout << " 10. Async Channel (Message Passing)\n\n";
 
     std::cout << "OTHER:\n";
     std::cout << "  0. Exit\n\n";
 
-    std::cout << "Select demo (0-9): ";
+    std::cout << "Select demo (0-10): ";
 }
 
 int main() {
@@ -489,6 +548,7 @@ int main() {
             case 7: demo_async_mutex(); break;
             case 8: demo_async_semaphore(); break;
             case 9: demo_async_file_io(); break;
+            case 10: demo_async_channel(); break;
             case 0:
                 clearScreen();
                 std::cout << "\nThank you for exploring PMAN!\n";
