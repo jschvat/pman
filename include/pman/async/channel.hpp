@@ -8,6 +8,7 @@
 #include <deque>
 #include <coroutine>
 #include <atomic>
+#include <mutex>
 
 namespace pman::async {
 
@@ -31,19 +32,21 @@ public:
     struct SendAwaiter {
         ChannelImpl<T>* channel;
         T value;
-        bool sent{false};
+        std::shared_ptr<bool> sent_flag;
 
         bool await_ready() const noexcept {
             // Check if we can send immediately
             if (channel->closed_.load(std::memory_order_acquire)) {
                 return true;  // Channel closed, fail immediately
             }
+            std::lock_guard<std::mutex> lock(channel->mutex_);
             return channel->buffer_.size() < channel->capacity_;
         }
 
         void await_suspend(std::coroutine_handle<> handle) {
-            // Add to waiting senders queue
-            channel->sendWaiters_.push_back({handle, std::move(value)});
+            // Add to waiting senders queue with a flag pointer
+            std::lock_guard<std::mutex> lock(channel->mutex_);
+            channel->sendWaiters_.push_back({handle, std::move(value), sent_flag});
         }
 
         bool await_resume() {
@@ -51,8 +54,8 @@ public:
                 return false;  // Channel was closed
             }
 
-            // If we were woken up, the value was already moved into buffer
-            return sent;
+            // Check if the value was successfully sent
+            return sent_flag && *sent_flag;
         }
     };
 
@@ -64,22 +67,27 @@ public:
 
         bool await_ready() const noexcept {
             // Check if we can receive immediately
-            return !channel->buffer_.empty() ||
-                   channel->closed_.load(std::memory_order_acquire);
+            if (channel->closed_.load(std::memory_order_acquire)) {
+                return true;
+            }
+            std::lock_guard<std::mutex> lock(channel->mutex_);
+            return !channel->buffer_.empty();
         }
 
         void await_suspend(std::coroutine_handle<> handle) {
             // Add to waiting receivers queue
+            std::lock_guard<std::mutex> lock(channel->mutex_);
             channel->recvWaiters_.push_back(handle);
         }
 
         std::optional<T> await_resume() {
+            std::lock_guard<std::mutex> lock(channel->mutex_);
             if (!channel->buffer_.empty()) {
                 T value = std::move(channel->buffer_.front());
                 channel->buffer_.pop_front();
 
-                // Wake up a waiting sender if any
-                channel->wakeNextSender();
+                // Wake up a waiting sender if any (already holding lock)
+                channel->wakeNextSenderLocked();
 
                 return value;
             }
@@ -90,7 +98,7 @@ public:
     };
 
     SendAwaiter sendAwaiter(T value) {
-        return SendAwaiter{this, std::move(value), false};
+        return SendAwaiter{this, std::move(value), std::make_shared<bool>(false)};
     }
 
     RecvAwaiter recvAwaiter() {
@@ -103,24 +111,26 @@ public:
             return false;
         }
 
+        std::lock_guard<std::mutex> lock(mutex_);
         if (buffer_.size() >= capacity_) {
             return false;
         }
 
         buffer_.push_back(std::move(value));
-        wakeNextReceiver();
+        wakeNextReceiverLocked();
         return true;
     }
 
     /// Try to receive without blocking
     std::optional<T> tryRecv() {
+        std::lock_guard<std::mutex> lock(mutex_);
         if (buffer_.empty()) {
             return std::nullopt;
         }
 
         T value = std::move(buffer_.front());
         buffer_.pop_front();
-        wakeNextSender();
+        wakeNextSenderLocked();
         return value;
     }
 
@@ -129,6 +139,7 @@ public:
     void close() {
         bool expected = false;
         if (closed_.compare_exchange_strong(expected, true, std::memory_order_release)) {
+            std::lock_guard<std::mutex> lock(mutex_);
             // Wake all waiting receivers
             for (auto handle : recvWaiters_) {
                 resumeHandle(handle);
@@ -148,6 +159,7 @@ public:
     }
 
     size_t size() const {
+        std::lock_guard<std::mutex> lock(mutex_);
         return buffer_.size();
     }
 
@@ -159,9 +171,11 @@ private:
     struct SendWaiter {
         std::coroutine_handle<> handle;
         T value;
+        std::shared_ptr<bool> sent_flag;
     };
 
-    void wakeNextReceiver() {
+    // Must be called with mutex_ held
+    void wakeNextReceiverLocked() {
         if (!recvWaiters_.empty()) {
             auto handle = recvWaiters_.front();
             recvWaiters_.pop_front();
@@ -169,7 +183,13 @@ private:
         }
     }
 
-    void wakeNextSender() {
+    void wakeNextReceiver() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        wakeNextReceiverLocked();
+    }
+
+    // Must be called with mutex_ held
+    void wakeNextSenderLocked() {
         if (!sendWaiters_.empty() && buffer_.size() < capacity_) {
             auto waiter = std::move(sendWaiters_.front());
             sendWaiters_.pop_front();
@@ -177,12 +197,22 @@ private:
             // Move the value into the buffer
             buffer_.push_back(std::move(waiter.value));
 
+            // Mark as successfully sent
+            if (waiter.sent_flag) {
+                *waiter.sent_flag = true;
+            }
+
             // Wake up a receiver if any
-            wakeNextReceiver();
+            wakeNextReceiverLocked();
 
             // Resume the sender
             resumeHandle(waiter.handle);
         }
+    }
+
+    void wakeNextSender() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        wakeNextSenderLocked();
     }
 
     void resumeHandle(std::coroutine_handle<> handle) {
@@ -196,6 +226,7 @@ private:
 
     size_t capacity_;
     std::atomic<bool> closed_;
+    mutable std::mutex mutex_;
     std::deque<T> buffer_;
     std::deque<std::coroutine_handle<>> recvWaiters_;
     std::deque<SendWaiter> sendWaiters_;

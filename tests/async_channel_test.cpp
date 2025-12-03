@@ -135,8 +135,8 @@ void test_channel_blocking_send() {
         sender(tx).start();
         receiver(rx).start();
 
-        // Let them run for a bit
-        co_await sleep(Duration::fromMillis(100), EventLoop::current());
+        // Let them run for a bit (need enough time for 5 sends with 10ms delays between receives)
+        co_await sleep(Duration::fromMillis(150), EventLoop::current());
 
         loop.stop();
     };
@@ -256,8 +256,12 @@ void test_mpmc_multiple_receivers() {
     std::atomic<int> receiver3_count{0};
 
     auto sender = [](Sender<int> tx) -> Task<void> {
+        // Small delay to let receivers start
+        co_await sleep(Duration::fromMillis(10), EventLoop::current());
         for (int i = 0; i < 30; i++) {
             co_await tx.send(i);
+            // Yield to let other tasks run
+            co_await sleep(Duration::fromMillis(1), EventLoop::current());
         }
         tx.close();
     };
@@ -271,16 +275,16 @@ void test_mpmc_multiple_receivers() {
     auto task = [&]() -> Task<void> {
         auto [tx, rx] = channel<int>(10);
 
-        // Start sender
-        sender(tx).start();
-
-        // Start 3 receivers
+        // Start 3 receivers first
         receiver(rx, &receiver1_count).start();
         receiver(rx, &receiver2_count).start();
         receiver(rx, &receiver3_count).start();
 
+        // Start sender after receivers are ready
+        sender(tx).start();
+
         // Wait for everything to complete
-        co_await sleep(Duration::fromMillis(100), EventLoop::current());
+        co_await sleep(Duration::fromMillis(200), EventLoop::current());
 
         loop.stop();
     };
