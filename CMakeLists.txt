@@ -244,6 +244,18 @@ target_link_libraries(pman_async_channel_test PRIVATE pman)
 add_executable(pman_async_stream_test tests/async_stream_test.cpp)
 target_link_libraries(pman_async_stream_test PRIVATE pman)
 
+add_executable(pman_async_actor_test tests/async_actor_test.cpp)
+target_link_libraries(pman_async_actor_test PRIVATE pman)
+
+add_executable(pman_async_actor_simple_test tests/async_actor_simple_test.cpp)
+target_link_libraries(pman_async_actor_simple_test PRIVATE pman)
+
+add_executable(pman_async_actor_minimal_test tests/async_actor_minimal_test.cpp)
+target_link_libraries(pman_async_actor_minimal_test PRIVATE pman)
+
+add_executable(pman_async_actor_debug_test tests/async_actor_debug_test.cpp)
+target_link_libraries(pman_async_actor_debug_test PRIVATE pman)
+
 if(PMAN_BUILD_TESTS)
     add_test(NAME pman_io_uring_test COMMAND pman_io_uring_test)
     add_test(NAME pman_combinators_test COMMAND pman_combinators_test)
@@ -251,4 +263,5 @@ if(PMAN_BUILD_TESTS)
     add_test(NAME pman_async_file_test COMMAND pman_async_file_test)
     add_test(NAME pman_async_channel_test COMMAND pman_async_channel_test)
     add_test(NAME pman_async_stream_test COMMAND pman_async_stream_test)
+    add_test(NAME pman_async_actor_test COMMAND pman_async_actor_test)
 endif()
